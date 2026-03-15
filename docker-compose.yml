@@ -1,0 +1,24 @@
+# Stock Image Auto Tagger
+# 実装時に使用する docker-compose の雛形
+
+services:
+  stock-tagger:
+    build: .
+    image: stock-tagger:latest
+    container_name: stock-tagger
+    ports:
+      - "0.0.0.0:${WEBUI_PORT:-7861}:7861"
+    volumes:
+      - ./data:/data
+    environment:
+      - HF_HOME=/data/hf_cache
+      - CUDA_VISIBLE_DEVICES=0
+      # USE_RAM=false で RAM++ を無効化（VRAM 節約時）
+      - USE_RAM=true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: [gpu]
+    restart: unless-stopped

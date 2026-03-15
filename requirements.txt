@@ -1,0 +1,13 @@
+# Stock Image Auto Tagger
+# torch はベースイメージに含まれる
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.6
+Pillow>=10.0.0
+transformers>=4.45.0
+accelerate>=0.26.0
+jinja2>=3.1.0
+# RAM++ (recognize-anything)
+timm>=0.4.12,<0.10.0
+huggingface_hub>=0.20.0
+numpy
