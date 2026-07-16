@@ -153,6 +153,14 @@ SOFTWARE
 
 ---
 
+## 3. JSZip / piexifjs（WebUI ZIP エクスポート）
+
+- **JSZip**: ZIP 生成（MIT）— https://github.com/Stuk/jszip
+- **piexifjs**: JPEG EXIF 書き込み（MIT）— https://github.com/hMatoba/piexifjs
+- 静的ファイル: `static/jszip.min.js`, `static/piexif.min.js`
+
+---
+
 ## 参照リンク
 
 | コンポーネント | リンク |
@@ -160,3 +168,5 @@ SOFTWARE
 | Florence-2 | https://huggingface.co/florence-community/Florence-2-base-ft |
 | RAM++ | https://github.com/xinyu1205/recognize-anything |
 | RAM++ モデル | https://huggingface.co/xinyu1205/recognize-anything-plus-model |
+| JSZip | https://github.com/Stuk/jszip |
+| piexifjs | https://github.com/hMatoba/piexifjs |

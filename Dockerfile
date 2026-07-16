@@ -18,6 +18,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app/ ./app/
 COPY ram/ ./ram/
+COPY static/ ./static/
 
 EXPOSE 7861
 

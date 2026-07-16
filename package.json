@@ -1,0 +1,16 @@
+{
+  "name": "stock-tagger-e2e",
+  "private": true,
+  "scripts": {
+    "test": "playwright test",
+    "test:smoke": "playwright test --grep-invert @gpu",
+    "test:gpu": "playwright test --grep @gpu",
+    "test:ui": "playwright test --ui",
+    "test:headed": "playwright test --headed",
+    "test:report": "playwright show-report",
+    "codegen": "playwright codegen http://localhost:7861"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.51.0"
+  }
+}

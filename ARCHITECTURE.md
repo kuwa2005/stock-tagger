@@ -270,7 +270,11 @@ stock-tagger/
 ├── app/
 │   ├── main.py
 │   ├── tagger.py
+│   ├── ram_tag.py
 │   └── utils.py
+├── ram/
+├── static/
+├── e2e/
 ├── Dockerfile
 ├── docker-compose.yml
 ├── ARCHITECTURE.md
@@ -498,13 +502,16 @@ CSV export
 
 # 16. 今後の優先開発
 
-優先順位
+優先順位（2026-07 時点）
 
-1. RAM++導入
-2. タグランキング
-3. WebUI改善
-4. バッチ並列化
-5. ストックサイトCSV対応
+1. ~~RAM++導入~~ → **完了**
+2. ~~WebUI 基本改善（DnD即時処理、Blocking mode、プレビュー、CSV/ZIP+Exif）~~ → **完了**
+3. タグランキング
+4. ストックサイト別 CSV 対応
+5. バッチ並列化
+6. キーワード翻訳（要否検討）
+
+WebUI / E2E / 表示翻訳フォールバックの詳細は README.md を参照。
 
 ---
 
