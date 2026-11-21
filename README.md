@@ -21,12 +21,21 @@ docker compose up -d --build
 | | |
 |--|--|
 | **WebUI** | http://localhost:7861 |
-| **Health** | `GET /health` |
+| **Health** | `GET /health`（プロセス生存） / `GET /ready`（モデル準備完了で 200） |
 | **タグ生成** | `POST /tag`（multipart `files`） |
 | **CSV API** | `POST /tag.csv` |
-| **翻訳フォールバック** | `POST /translate`（表示用 en→ja） |
+| **翻訳フォールバック** | `POST /translate`（表示用 en→ja、既定は無効） |
+| **設定参照** | `GET /config`（WebUI 用） |
 
-初回は Florence-2（約 1GB）と RAM++（約 3GB）のダウンロードが発生します。
+初回は Florence-2（約 1GB）と RAM++（約 3GB）のダウンロードが発生します。起動時にバックグラウンドで事前ロードされるため、`GET /ready` が 200 になってから利用してください。
+
+### アクセス範囲とセキュリティ
+
+* 既定では **127.0.0.1（このマシン）からのみ** 接続できます。API に認証はないため、他端末から使う場合はリバースプロキシでアクセス制限をかけてください（直接公開は `.env` の `BIND_ADDRESS`）。
+* `/translate` は外部サービス（MyMemory）へキャプションを送信するため **既定で無効** です。必要な場合のみ社内承認のうえ `ENABLE_EXTERNAL_TRANSLATE=true` を設定してください。無効時、日本語表示は Chrome Translator API（ブラウザ内処理）が使える場合のみ行われます。
+* アップロードは 1 ファイル `MAX_UPLOAD_MB`（既定 50MB）、1 リクエスト `MAX_FILES_PER_REQUEST`（既定 50 枚）まで。
+
+その他の設定項目は `.env.example` を参照してください。
 
 ## 主な WebUI 機能
 
@@ -36,7 +45,7 @@ docker compose up -d --build
 * **Download CSV** / **Download ZIP**（JPEG は Exif に title/caption/keywords 埋め込み）
   * ZIP には画像のみ同梱（Chrome の ZIP+CSV ブロック回避）。メタは CSV を別途ダウンロード
 * ブラウザ言語が日本語のとき、Title / Caption を日本語表示
-  * Chrome Translator API があれば優先、なければサーバー経由フォールバック
+  * Chrome Translator API があれば優先、なければサーバー経由フォールバック（`ENABLE_EXTERNAL_TRANSLATE=true` 時のみ）
 * キーワードの自動翻訳は未実装（保留）
 
 ## E2E テスト（Playwright）
@@ -60,6 +69,9 @@ npm run test:gpu      # タグ生成（GPU）込み
 curl -s http://localhost:7861/health
 
 curl -s -F "files=@photo.jpg" http://localhost:7861/tag | jq .
+
+# キーワード数を指定（1〜100）
+curl -s -F "files=@photo.jpg" -F "max_keywords=49" http://localhost:7861/tag | jq .
 
 curl -s -X POST http://localhost:7861/translate \
   -H 'Content-Type: application/json' \

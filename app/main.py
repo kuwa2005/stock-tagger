@@ -2,25 +2,90 @@
 import io
 import csv
 import json
+import logging
 import os
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import List, Optional
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
-from fastapi.responses import HTMLResponse, PlainTextResponse, FileResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from PIL import Image
+from PIL import Image, ImageOps
 
 from .tagger import tag_image
+
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper())
+logger = logging.getLogger("stock_tagger")
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.environ.get(name)
+    if v is None or v.strip() == "":
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+# ---- 設定（環境変数） ----
+USE_RAM_DEFAULT = _env_bool("USE_RAM", True)
+# 外部翻訳 API（MyMemory）へのテキスト送信。既定は無効（機密保護のため明示的に有効化が必要）
+ENABLE_EXTERNAL_TRANSLATE = _env_bool("ENABLE_EXTERNAL_TRANSLATE", False)
+PRELOAD_MODELS = _env_bool("PRELOAD_MODELS", True)
+MAX_UPLOAD_MB = _env_int("MAX_UPLOAD_MB", 50)
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+MAX_FILES_PER_REQUEST = _env_int("MAX_FILES_PER_REQUEST", 50)
+MAX_KEYWORDS_DEFAULT = _env_int("MAX_KEYWORDS", 20)
+MAX_KEYWORDS_LIMIT = 100
+
+# 解凍爆弾対策: これを超える画素数の画像は Pillow が DecompressionBombError を送出
+Image.MAX_IMAGE_PIXELS = _env_int("MAX_IMAGE_PIXELS", 100_000_000)
+
+# GPU 推論は 1 件ずつ（並行実行による VRAM 不足・競合を防ぐ）
+_inference_lock = threading.Lock()
+
+_model_state = {"status": "not_loaded", "error": None}
+
+
+def _preload_models() -> None:
+    _model_state["status"] = "loading"
+    try:
+        from .tagger import load_model
+        load_model()
+        if USE_RAM_DEFAULT:
+            from .ram_tag import load_ram_model
+            load_ram_model()
+        _model_state["status"] = "ready"
+        logger.info("Models preloaded")
+    except Exception as e:  # ロード失敗でもサーバーは起動させ、/ready で通知
+        logger.exception("Model preload failed")
+        _model_state["status"] = "error"
+        _model_state["error"] = str(e)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    if PRELOAD_MODELS:
+        threading.Thread(target=_preload_models, name="model-preload", daemon=True).start()
+    yield
+
 
 app = FastAPI(
     title="Stock Image Auto Tagger",
     description="Auto-generate stock photo tags, titles, and captions",
-    version="0.1.0",
+    version="0.2.0",
+    lifespan=lifespan,
 )
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -35,16 +100,23 @@ async def favicon():
 
 class TranslateRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=4000)
-    source: str = "en"
-    target: str = "ja"
+    source: str = Field("en", pattern=r"^[a-z]{2}(-[A-Za-z]{2})?$")
+    target: str = Field("ja", pattern=r"^[a-z]{2}(-[A-Za-z]{2})?$")
 
 
 @app.post("/translate")
-async def translate_text(payload: TranslateRequest):
+def translate_text(payload: TranslateRequest):
     """
     Fallback translation when Chrome Translator API is unavailable.
     Uses MyMemory free API (en→ja for display only).
+    ENABLE_EXTERNAL_TRANSLATE=true のときのみ有効（テキストが外部サービスへ送信されるため）。
+    同期関数にしてスレッドプールで実行し、イベントループをブロックしない。
     """
+    if not ENABLE_EXTERNAL_TRANSLATE:
+        raise HTTPException(
+            status_code=403,
+            detail={"error": "External translation is disabled on this server", "code": "translate_disabled"},
+        )
     source = (payload.source or "en").strip().lower()
     target = (payload.target or "ja").strip().lower()
     text = payload.text.strip()
@@ -56,7 +128,7 @@ async def translate_text(payload: TranslateRequest):
     query = urllib.parse.urlencode({"q": chunk, "langpair": f"{source}|{target}"})
     url = f"https://api.mymemory.translated.net/get?{query}"
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "stock-tagger/0.1"})
+        req = urllib.request.Request(url, headers={"User-Agent": "stock-tagger/0.2"})
         with urllib.request.urlopen(req, timeout=20) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
         translated = (
@@ -70,40 +142,110 @@ async def translate_text(payload: TranslateRequest):
         raise
     except urllib.error.HTTPError as e:
         raise HTTPException(status_code=502, detail={"error": f"Translation HTTP error: {e.code}"})
-    except Exception as e:
-        raise HTTPException(status_code=502, detail={"error": f"Translation failed: {e}"})
+    except Exception:
+        logger.exception("Translation failed")
+        raise HTTPException(status_code=502, detail={"error": "Translation failed"})
 
 
 @app.get("/health")
 async def health():
-    """ヘルスチェック"""
+    """ヘルスチェック（プロセス生存確認。モデル準備状況は /ready）"""
     return {"status": "ok"}
 
 
+@app.get("/ready")
+async def ready():
+    """モデルのロードが完了していれば 200、未完了なら 503"""
+    status = _model_state["status"]
+    body = {"status": status}
+    if _model_state["error"]:
+        body["error"] = _model_state["error"]
+    if status == "ready":
+        return body
+    if status == "not_loaded" and not PRELOAD_MODELS:
+        # 遅延ロード構成では、初回推論時にロードされる
+        body["status"] = "lazy"
+        return body
+    return JSONResponse(status_code=503, content=body)
+
+
+@app.get("/config")
+async def config():
+    """WebUI が参照するサーバー設定（機密情報は含めない）"""
+    return {
+        "external_translate": ENABLE_EXTERNAL_TRANSLATE,
+        "max_upload_mb": MAX_UPLOAD_MB,
+        "max_files_per_request": MAX_FILES_PER_REQUEST,
+        "max_keywords": MAX_KEYWORDS_DEFAULT,
+    }
+
+
+def _check_file_count(files: List[UploadFile]) -> None:
+    if len(files) > MAX_FILES_PER_REQUEST:
+        raise HTTPException(
+            status_code=413,
+            detail={"error": f"Too many files (max {MAX_FILES_PER_REQUEST} per request)"},
+        )
+
+
+def _read_upload_image(f: UploadFile) -> Image.Image:
+    """アップロードを上限付きで読み込み、EXIF の回転を反映した RGB 画像を返す。失敗時は ValueError"""
+    data = f.file.read(MAX_UPLOAD_BYTES + 1)
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise ValueError(f"File too large (max {MAX_UPLOAD_MB} MB)")
+    try:
+        img = Image.open(io.BytesIO(data))
+        img = ImageOps.exif_transpose(img)
+        return img.convert("RGB")
+    except Image.DecompressionBombError:
+        raise ValueError("Image has too many pixels")
+    except Exception as e:
+        raise ValueError(f"Failed to read image: {e}")
+
+
+def _resolve_max_keywords(value: Optional[int]) -> int:
+    n = MAX_KEYWORDS_DEFAULT if value is None else value
+    return max(1, min(int(n), MAX_KEYWORDS_LIMIT))
+
+
+def _run_tagging(img: Image.Image, **kwargs) -> dict:
+    with _inference_lock:
+        return tag_image(img, **kwargs)
+
+
+def _is_image_upload(f: UploadFile) -> bool:
+    return bool(f.content_type and f.content_type.startswith("image/"))
+
+
 @app.post("/tag")
-async def tag(
+def tag(
     files: List[UploadFile] = File(...),
     include_od: bool = Form(False),
-    use_ram: bool = Form(default=None),
+    use_ram: Optional[bool] = Form(default=None),
+    max_keywords: Optional[int] = Form(default=None),
 ):
     """
     画像からタグ・タイトル・キャプションを生成。
     use_ram: RAM++ でタグ補強（未指定時は環境変数 USE_RAM、デフォルト True）
+    max_keywords: キーワード上限（未指定時は環境変数 MAX_KEYWORDS、デフォルト 20、最大 100）
+    同期関数にしてスレッドプールで実行し、推論中も他のリクエスト（/health 等）が応答できるようにする。
     """
-    use_ram_flag = use_ram if use_ram is not None else os.environ.get("USE_RAM", "true").lower() in ("1", "true", "yes")
+    _check_file_count(files)
+    use_ram_flag = use_ram if use_ram is not None else USE_RAM_DEFAULT
+    kw_limit = _resolve_max_keywords(max_keywords)
     results = []
     for f in files:
-        if not f.content_type or not f.content_type.startswith("image/"):
+        if not _is_image_upload(f):
             continue
-        data = await f.read()
         try:
-            img = Image.open(io.BytesIO(data)).convert("RGB")
-        except Exception as e:
-            raise HTTPException(status_code=400, detail={"error": f"Failed to read image: {e}"})
+            img = _read_upload_image(f)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail={"error": str(e), "filename": f.filename})
         try:
-            result = tag_image(img, include_od=include_od, use_ram=use_ram_flag)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail={"error": str(e)})
+            result = _run_tagging(img, include_od=include_od, use_ram=use_ram_flag, max_keywords=kw_limit)
+        except Exception:
+            logger.exception("Tagging failed: %s", f.filename)
+            raise HTTPException(status_code=500, detail={"error": "Tagging failed", "filename": f.filename})
         result["filename"] = f.filename or "image"
         results.append(result)
     if not results:
@@ -112,26 +254,32 @@ async def tag(
 
 
 @app.post("/tag.csv", response_class=PlainTextResponse)
-async def tag_csv(files: List[UploadFile] = File(...)):
-    """複数画像をタグ付けし、CSV形式で返す"""
+def tag_csv(
+    files: List[UploadFile] = File(...),
+    max_keywords: Optional[int] = Form(default=None),
+):
+    """複数画像をタグ付けし、CSV形式で返す（読めない画像はスキップ）"""
+    _check_file_count(files)
+    use_ram_flag = USE_RAM_DEFAULT
+    kw_limit = _resolve_max_keywords(max_keywords)
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["filename", "title", "caption", "keywords"])
     row_count = 0
 
     for f in files:
-        if not f.content_type or not f.content_type.startswith("image/"):
+        if not _is_image_upload(f):
             continue
-        data = await f.read()
         try:
-            img = Image.open(io.BytesIO(data)).convert("RGB")
+            img = _read_upload_image(f)
+        except ValueError as e:
+            logger.warning("Skipping %s: %s", f.filename, e)
+            continue
+        try:
+            result = _run_tagging(img, use_ram=use_ram_flag, max_keywords=kw_limit)
         except Exception:
-            continue
-        try:
-            use_ram_flag = os.environ.get("USE_RAM", "true").lower() in ("1", "true", "yes")
-            result = tag_image(img, use_ram=use_ram_flag)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail={"error": str(e)})
+            logger.exception("Tagging failed: %s", f.filename)
+            raise HTTPException(status_code=500, detail={"error": "Tagging failed", "filename": f.filename})
         keywords_str = ",".join(result["keywords"]) if result["keywords"] else ""
         writer.writerow([
             f.filename or "image",
@@ -416,7 +564,7 @@ async def index():
         let translatorPromise = null;
         let translationEngine = ''; // 'chrome' | 'fallback' | ''
         const translationCache = new Map();
-        const IMG_EXTS = /\.(jpe?g|png|gif|webp|bmp)$/i;
+        const IMG_EXTS = /\\.(jpe?g|png|gif|webp|bmp)$/i;
 
         function getBrowserLanguages() {
             const list = [];
@@ -469,6 +617,9 @@ async def index():
                 a === 'after-download'
             );
         }
+        // サーバー設定（/config）。取得前・失敗時は安全側（外部翻訳なし）で動作
+        const serverConfig = { external_translate: false };
+
         async function ensureTranslator() {
             if (!isJapaneseDisplayLanguage()) return null;
             if (!translationApiAvailable()) return null;
@@ -504,6 +655,11 @@ async def index():
             return translatorPromise;
         }
         async function translateViaFallback(text) {
+            if (!serverConfig.external_translate) {
+                // サーバー側で外部翻訳が無効: 英語のまま表示
+                translationEngine = 'none';
+                return text;
+            }
             const res = await fetch('/translate', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -551,6 +707,12 @@ async def index():
 
             if (translationApiAvailable()) {
                 setTranslationStatus('Translating title/caption to Japanese (Chrome Translator)...', 'warn');
+            } else if (!serverConfig.external_translate) {
+                setTranslationStatus(
+                    'Chrome Translator unavailable (' + translatorUnavailableReason() + '). Online fallback is disabled on this server — showing English.',
+                    'warn'
+                );
+                return;
             } else {
                 setTranslationStatus(
                     'Chrome Translator unavailable (' + translatorUnavailableReason() + '). Using online fallback...',
@@ -569,6 +731,8 @@ async def index():
                     setTranslationStatus('Title/Caption translated to Japanese via Chrome Translator (keywords stay English).', 'active');
                 } else if (translationEngine === 'fallback') {
                     setTranslationStatus('Title/Caption translated to Japanese via online fallback (keywords stay English).', 'active');
+                } else if (translationEngine === 'none') {
+                    setTranslationStatus('Chrome Translator unavailable and online fallback is disabled on this server — showing English.', 'warn');
                 }
             }
         }
@@ -741,7 +905,9 @@ async def index():
             } catch (e) { ngKeywords = new Set(); }
         }
         function saveNgKeywords() {
-            localStorage.setItem(NG_STORAGE_KEY, JSON.stringify([...ngKeywords].sort()));
+            try {
+                localStorage.setItem(NG_STORAGE_KEY, JSON.stringify([...ngKeywords].sort()));
+            } catch (e) { console.warn('[stock-tagger] could not save blocked keywords:', e); }
         }
         function isNgKeyword(k) {
             return ngKeywords.has(k.toLowerCase());
@@ -754,8 +920,16 @@ async def index():
             ngList.innerHTML = '';
             [...ngKeywords].sort().forEach(k => {
                 const li = document.createElement('li');
-                li.innerHTML = '<span>' + k + '</span><button type="button" class="removeBtn" data-k="' + k + '">Remove</button>';
-                li.querySelector('.removeBtn').onclick = () => { ngKeywords.delete(k); saveNgKeywords(); renderNgList(); if (resultEntries.length) renderResults(); };
+                // textContent で設定し、インポートされた値による HTML/スクリプト注入を防ぐ
+                const label = document.createElement('span');
+                label.textContent = k;
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.className = 'removeBtn';
+                btn.dataset.k = k;
+                btn.textContent = 'Remove';
+                li.append(label, btn);
+                btn.onclick = () => { ngKeywords.delete(k); saveNgKeywords(); renderNgList(); if (resultEntries.length) renderResults(); };
                 ngList.appendChild(li);
             });
         }
@@ -843,7 +1017,7 @@ async def index():
         }
         function withDownloadTimestamp(filename) {
             const name = String(filename || 'download');
-            const m = name.match(/^(.*?)(\.[^.]+)?$/);
+            const m = name.match(/^(.*?)(\\.[^.]+)?$/);
             const stem = m[1] || 'download';
             const ext = m[2] || '';
             return stem + '_' + downloadTimestamp() + ext;
@@ -881,7 +1055,7 @@ async def index():
         function isJpegFile(file) {
             if (!file) return false;
             const name = (file.name || '').toLowerCase();
-            return file.type === 'image/jpeg' || /\.jpe?g$/.test(name);
+            return file.type === 'image/jpeg' || /\\.jpe?g$/.test(name);
         }
         function arrayBufferToBinaryString(buf) {
             const bytes = new Uint8Array(buf);
@@ -900,7 +1074,7 @@ async def index():
         function uniqueZipName(name, used) {
             let base = name || 'image.jpg';
             if (!used.has(base)) { used.add(base); return base; }
-            const m = base.match(/^(.*?)(\.[^.]+)?$/);
+            const m = base.match(/^(.*?)(\\.[^.]+)?$/);
             const stem = m[1] || 'image';
             const ext = m[2] || '';
             let i = 2;
@@ -1103,9 +1277,9 @@ async def index():
             const formData = new FormData();
             formData.append('files', file);
             const res = await fetch('/tag', { method: 'POST', body: formData });
-            const data = await res.json();
+            const data = await res.json().catch(() => ({}));
             if (!res.ok) {
-                const msg = data.detail?.error || data.detail || JSON.stringify(data);
+                const msg = data.detail?.error || (typeof data.detail === 'string' ? data.detail : '') || ('HTTP ' + res.status);
                 throw new Error(msg);
             }
             const row = Array.isArray(data) ? data[0] : (data.results ? data.results[0] : data);
@@ -1219,9 +1393,17 @@ async def index():
             showResultToolbar(false);
         };
 
+        async function loadServerConfig() {
+            try {
+                const res = await fetch('/config');
+                if (res.ok) Object.assign(serverConfig, await res.json());
+            } catch (e) { console.warn('[stock-tagger] could not load server config:', e); }
+        }
+
         bindCsvDownload();
         bindZipDownload();
         loadNgKeywords();
+        loadServerConfig();
     </script>
 </body>
 </html>

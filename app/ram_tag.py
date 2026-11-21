@@ -7,6 +7,9 @@ _app_root = Path(__file__).resolve().parents[1]
 if str(_app_root) not in sys.path:
     sys.path.insert(0, str(_app_root))
 
+import logging
+import threading
+
 import torch
 from PIL import Image
 from typing import List
@@ -15,6 +18,8 @@ _ram_model = None
 _ram_transform = None
 _device = None
 _ram_root = _app_root / "ram"
+_load_lock = threading.Lock()
+logger = logging.getLogger(__name__)
 
 
 def _get_device() -> str:
@@ -34,7 +39,6 @@ def _get_checkpoint_path() -> Path:
             repo_id="xinyu1205/recognize-anything-plus-model",
             filename="ram_plus_swin_large_14m.pth",
             local_dir=str(checkpoint_dir),
-            local_dir_use_symlinks=False,
         )
         path = Path(downloaded)
     return path
@@ -45,7 +49,14 @@ def load_ram_model():
     global _ram_model, _ram_transform, _device
     if _ram_model is not None:
         return
+    with _load_lock:
+        if _ram_model is not None:
+            return
+        _load_ram_model_locked()
 
+
+def _load_ram_model_locked():
+    global _ram_model, _ram_transform, _device
     _device = _get_device()
     checkpoint_path = _get_checkpoint_path()
 
@@ -54,13 +65,14 @@ def load_ram_model():
     from ram import inference_ram, get_transform
 
     _ram_transform = get_transform(image_size=384)
-    _ram_model = ram_plus(
+    model = ram_plus(
         pretrained=str(checkpoint_path),
         image_size=384,
         vit="swin_l",
     )
-    _ram_model.eval()
-    _ram_model = _ram_model.to(_device)
+    model.eval()
+    _ram_model = model.to(_device)  # 最後に代入し、ロード途中のモデルが参照されないようにする
+    logger.info("RAM++ loaded on %s", _device)
 
 
 def get_ram_tags(image: Image.Image) -> List[str]:
